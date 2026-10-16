@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "emanuel.gtasks",
+  "name": "Google Tasks",
+  "version": "1.0.0",
+  "author": "Emanuel4100",
+  "license": "MIT",
+  "description": "Google Tasks in the bar: see open tasks, add new ones, and check them off without leaving Omarchy.",
+  "homepage": "https://github.com/Emanuel4100/omarchy-google-tasks",
+  "repository": "https://github.com/Emanuel4100/omarchy-google-tasks",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Tasks",
+    "description": "Open-task count from Google Tasks. Click for the task panel, middle-click to add a task, right-click to refresh.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show open-task count",
+        "description": "Show how many tasks are open next to the icon.",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh every (minutes)",
+        "description": "How often to fetch changes made in other Google Tasks apps.",
+        "min": 1,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

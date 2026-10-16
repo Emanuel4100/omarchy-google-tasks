@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""gtasks: a small Google Tasks client for the emanuel.gtasks Omarchy plugin.
+
+Standard library only. It signs in with the OAuth "installed app" loopback
+flow (PKCE), keeps the refresh token in $XDG_STATE_HOME/gtasks/token.json
+(mode 0600), and talks to the Tasks REST API directly.
+
+    gtasks auth [--client-secret FILE]   sign in (opens the browser)
+    gtasks logout                        forget the stored token
+    gtasks lists                         show task lists
+    gtasks use LIST                      make a list (id or title) the default
+    gtasks show [--list ID]              show tasks
+    gtasks add TITLE [--list ID] [--notes TEXT] [--due YYYY-MM-DD]
+    gtasks done|undo|delete TASK_ID [--list ID]
+    gtasks snapshot [--list ID]          everything the bar widget renders
+
+Every command takes --json. With it, the result (or {"ok": false, "error",
+"code"}) is printed as one JSON object on stdout. The widget relies on that.
+"""
+
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+SCOPE = "https://www.googleapis.com/auth/tasks"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+API = "https://tasks.googleapis.com/tasks/v1"
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "gtasks")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "gtasks")
+CLIENT_SECRET = os.path.join(CONFIG_DIR, "client_secret.json")
+TOKEN_FILE = os.path.join(STATE_DIR, "token.json")
+SELECTED_FILE = os.path.join(STATE_DIR, "selected.json")
+
+SETUP_HINT = (
+    "Create a Desktop OAuth client in Google Cloud (Tasks API enabled), "
+    "save its JSON as " + CLIENT_SECRET + ", then run: gtasks auth"
+)
+
+SETUP_STEPS = """\
+One-time Google Cloud setup (about 5 minutes):
+
+  1. Open https://console.cloud.google.com/projectcreate and create a project
+     (any name, e.g. "omarchy-tasks").
+  2. Enable the Tasks API for it:
+     https://console.cloud.google.com/apis/library/tasks.googleapis.com
+  3. Google Auth Platform > Branding: fill in an app name, your email, and
+       home page:       https://github.com/Emanuel4100/omarchy-google-tasks
+       privacy policy:  https://github.com/Emanuel4100/omarchy-google-tasks/blob/main/PRIVACY.md
+       authorized domain: github.com
+     Audience: choose External, then press "Publish app" (In production).
+     Leaving it in Testing makes Google end the sign-in every 7 days.
+  4. Google Auth Platform > Clients > Create client > Application type
+     "Desktop app". Download the JSON right away: Google shows the secret
+     only once.
+  5. Run:  gtasks auth --client-secret ~/Downloads/client_secret_*.json
+
+Google will warn that the app is unverified, because you made it yourself.
+Choose Advanced > Go to <app name>.
+"""
+
+
+class GTasksError(Exception):
+    def __init__(self, message, code="error"):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------- storage
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_private_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".token-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_client(path=CLIENT_SECRET):
+    try:
+        data = read_json(path)
+    except FileNotFoundError:
+        raise GTasksError("No OAuth client found. " + SETUP_HINT, "setup_required")
+    except (OSError, ValueError) as e:
+        raise GTasksError("Could not read %s: %s" % (path, e), "setup_required")
+    block = data.get("installed") or data.get("web") or data
+    if not block.get("client_id") or not block.get("client_secret"):
+        raise GTasksError(path + " is not a Google OAuth client JSON. " + SETUP_HINT, "setup_required")
+    return {"client_id": block["client_id"], "client_secret": block["client_secret"]}
+
+
+def load_token():
+    try:
+        return read_json(TOKEN_FILE)
+    except FileNotFoundError:
+        load_client()  # no client JSON yet: report setup, not sign-in
+        raise GTasksError("Not signed in. Run: gtasks auth", "auth_required")
+    except (OSError, ValueError) as e:
+        raise GTasksError("Could not read %s: %s" % (TOKEN_FILE, e), "auth_required")
+
+
+# ------------------------------------------------------------------ http
+
+
+def http_json(method, url, body=None, headers=None, form=False):
+    data = None
+    headers = dict(headers or {})
+    if body is not None:
+        if form:
+            data = urllib.parse.urlencode(body).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            payload = json.loads(raw) if raw else None
+        except ValueError:
+            payload = {"error": raw.decode(errors="replace")}
+        return e.code, payload
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise GTasksError("Network error: %s" % reason, "offline")
+
+
+def error_message(payload, fallback):
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return err.get("message") or fallback
+        if isinstance(err, str):
+            return payload.get("error_description") or err
+    return fallback
+
+
+# ------------------------------------------------------------------ auth
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def cmd_auth(args):
+    client_path = args.client_secret or CLIENT_SECRET
+    if not os.path.exists(client_path):
+        print(SETUP_STEPS, file=sys.stderr)
+    client = load_client(client_path)
+    if args.client_secret and os.path.abspath(args.client_secret) != os.path.abspath(CLIENT_SECRET):
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        write_private_json(CLIENT_SECRET, read_json(args.client_secret))
+
+    verifier = b64url(secrets.token_bytes(48))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    state = secrets.token_urlsafe(24)
+    result = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "state" not in query and "code" not in query and "error" not in query:
+                self.send_response(404)
+                self.end_headers()
+                return
+            if query.get("state", [""])[0] != state:
+                result["error"] = "state mismatch"
+            elif "error" in query:
+                result["error"] = query["error"][0]
+            else:
+                result["code"] = query.get("code", [""])[0]
+            ok = "code" in result
+            page = ("Signed in to Google Tasks. You can close this tab." if ok
+                    else "Sign-in failed: %s" % result.get("error"))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("<!doctype html><title>gtasks</title><body style='font:16px sans-serif;padding:3em'>%s</body>"
+                              % page).encode())
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    redirect = "http://127.0.0.1:%d" % server.server_address[1]
+    url = AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"],
+        "redirect_uri": redirect,
+        "response_type": "code",
+        "scope": SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    })
+    print("Opening your browser to sign in to Google Tasks.", file=sys.stderr)
+    print("If it does not open, visit:\n\n  %s\n" % url, file=sys.stderr)
+    webbrowser.open(url)
+
+    server.timeout = 1
+    deadline = time.time() + 300
+    while not result and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+    if "code" not in result:
+        raise GTasksError("Sign-in did not finish: %s" % result.get("error", "timed out"), "auth_required")
+
+    status, payload = http_json("POST", TOKEN_URL, {
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "code": result["code"],
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect,
+    }, form=True)
+    if status != 200 or not payload.get("refresh_token"):
+        raise GTasksError("Token exchange failed: " + error_message(payload, "HTTP %d" % status), "auth_required")
+    token = save_token(payload, None)
+    lists = api("GET", "/users/@me/lists")
+    names = [l.get("title", "") for l in lists.get("items", [])]
+    data = {"ok": True, "lists": names}
+    text = "Signed in. Task lists: " + ", ".join(names)
+    if token.get("refresh_expires_at"):
+        days = max(1, round((token["refresh_expires_at"] - time.time()) / 86400))
+        data["refreshExpiresAt"] = token["refresh_expires_at"]
+        text += ("\n\nWarning: Google will end this sign-in in %d day%s, which means the OAuth app is "
+                 "still in Testing. To stop this, %s, then run gtasks auth again."
+                 % (days, "" if days == 1 else "s", PUBLISH_HINT))
+    return data, text
+
+
+def save_token(payload, previous):
+    token = dict(previous or {})
+    token["access_token"] = payload["access_token"]
+    token["expires_at"] = int(time.time()) + int(payload.get("expires_in", 3600))
+    if payload.get("refresh_token"):
+        token["refresh_token"] = payload["refresh_token"]
+    # Google sends this for time-limited grants. Best-effort hint that the
+    # OAuth app is still in "Testing", where sign-ins end after 7 days.
+    if payload.get("refresh_token_expires_in"):
+        token["refresh_expires_at"] = int(time.time()) + int(payload["refresh_token_expires_in"])
+    write_private_json(TOKEN_FILE, token)
+    return token
+
+
+def refresh_expires_at():
+    try:
+        return int(load_token().get("refresh_expires_at") or 0)
+    except (GTasksError, ValueError, TypeError):
+        return 0
+
+
+PUBLISH_HINT = "publish the OAuth app (Google Auth Platform > Audience > Publish app)"
+
+
+def access_token(force_refresh=False):
+    token = load_token()
+    if not force_refresh and token.get("access_token") and token.get("expires_at", 0) - 60 > time.time():
+        return token["access_token"]
+    if not token.get("refresh_token"):
+        raise GTasksError("Stored token has no refresh token. Run: gtasks auth", "auth_required")
+    client = load_client()
+    status, payload = http_json("POST", TOKEN_URL, {
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "refresh_token": token["refresh_token"],
+        "grant_type": "refresh_token",
+    }, form=True)
+    if status != 200:
+        if isinstance(payload, dict) and payload.get("error") == "invalid_grant":
+            # Revoked, or the 7-day expiry of an OAuth app left in "Testing".
+            raise GTasksError("Google ended the sign-in. If this happens about every 7 days, the OAuth "
+                              "app is still in Testing: %s, then reconnect (gtasks auth)." % PUBLISH_HINT,
+                              "auth_expired")
+        code = "auth_required" if status in (400, 401) else "error"
+        raise GTasksError("Google refused the stored sign-in (%s). Run: gtasks auth"
+                          % error_message(payload, "HTTP %d" % status), code)
+    return save_token(payload, token)["access_token"]
+
+
+def api(method, path, body=None, params=None):
+    url = API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    for attempt in (0, 1):
+        headers = {"Authorization": "Bearer " + access_token(force_refresh=attempt == 1)}
+        status, payload = http_json(method, url, body, headers)
+        if status == 401 and attempt == 0:
+            continue
+        if status >= 400:
+            code = {401: "auth_required", 403: "forbidden", 404: "not_found"}.get(status, "error")
+            raise GTasksError(error_message(payload, "HTTP %d" % status), code)
+        return payload or {}
+    raise GTasksError("Unauthorized", "auth_required")
+
+
+def cmd_logout(args):
+    try:
+        token = load_token()
+    except GTasksError:
+        return {"ok": True}, "Not signed in."
+    if token.get("refresh_token"):
+        try:
+            http_json("POST", REVOKE_URL, {"token": token["refresh_token"]}, form=True)
+        except GTasksError:
+            pass
+    os.unlink(TOKEN_FILE)
+    return {"ok": True}, "Signed out."
+
+
+# ----------------------------------------------------------------- tasks
+
+
+def lists_raw():
+    items, page = [], None
+    while True:
+        params = {"maxResults": 100}
+        if page:
+            params["pageToken"] = page
+        data = api("GET", "/users/@me/lists", params=params)
+        items += data.get("items", [])
+        page = data.get("nextPageToken")
+        if not page:
+            return [{"id": l["id"], "title": l.get("title", "")} for l in items]
+
+
+def tasks_raw(list_id):
+    items, page = [], None
+    while True:
+        # Tasks completed in Google's own apps come back hidden; showHidden
+        # keeps them in the completed section.
+        params = {"maxResults": 100, "showCompleted": "true", "showHidden": "true"}
+        if page:
+            params["pageToken"] = page
+        data = api("GET", "/lists/%s/tasks" % urllib.parse.quote(list_id, safe="@"), params=params)
+        items += data.get("items", [])
+        page = data.get("nextPageToken")
+        if not page:
+            return items
+
+
+def shape_task(t, depth):
+    return {
+        "id": t["id"],
+        "title": t.get("title", "") or "",
+        "notes": t.get("notes", "") or "",
+        "due": (t.get("due") or "")[:10],
+        "completed": t.get("status") == "completed",
+        "completedAt": t.get("completed", "") or "",
+        "parent": t.get("parent", "") or "",
+        "depth": depth,
+    }
+
+
+def ordered_tasks(raw):
+    """Google's order: by position, each subtask right under its parent."""
+    raw = [t for t in raw if not t.get("deleted") and (t.get("title") or "").strip()]
+    by_parent = {}
+    ids = {t["id"] for t in raw}
+    for t in raw:
+        parent = t.get("parent") if t.get("parent") in ids else ""
+        by_parent.setdefault(parent, []).append(t)
+    for children in by_parent.values():
+        children.sort(key=lambda t: t.get("position", ""))
+
+    open_tasks = []
+
+    def walk(parent, depth):
+        for t in by_parent.get(parent, []):
+            if t.get("status") != "completed":
+                open_tasks.append(shape_task(t, depth))
+                walk(t["id"], depth + 1)
+            else:
+                # An open subtask of a completed parent still belongs in the list.
+                walk(t["id"], depth)
+
+    walk("", 0)
+    done = [shape_task(t, 0) for t in raw if t.get("status") == "completed"]
+    done.sort(key=lambda t: t["completedAt"], reverse=True)
+    return open_tasks, done
+
+
+def selected_list():
+    try:
+        return read_json(SELECTED_FILE).get("list") or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def resolve_list(lists, wanted):
+    if not lists:
+        raise GTasksError("This Google account has no task lists.", "not_found")
+    wanted = wanted or selected_list()
+    if wanted and wanted != "@default":
+        for l in lists:
+            if l["id"] == wanted or l["title"].lower() == wanted.lower():
+                return l
+    return lists[0]
+
+
+def cmd_snapshot(args):
+    lists = lists_raw()
+    current = resolve_list(lists, args.list)
+    open_tasks, done = ordered_tasks(tasks_raw(current["id"]))
+    data = {
+        "ok": True,
+        "fetched": int(time.time()),
+        "lists": lists,
+        "list": current,
+        "open": open_tasks,
+        "completed": done[: args.completed_limit],
+        "completedCount": len(done),
+    }
+    expires = refresh_expires_at()
+    if expires:
+        data["refreshExpiresAt"] = expires
+    return data, None
+
+
+def cmd_use(args):
+    lists = lists_raw()
+    wanted = " ".join(args.name)
+    match = [l for l in lists if l["id"] == wanted or l["title"].lower() == wanted.lower()]
+    if not match:
+        raise GTasksError("No task list called %r." % wanted, "not_found")
+    write_private_json(SELECTED_FILE, {"list": match[0]["id"]})
+    args.list = match[0]["id"]
+    data, _ = cmd_snapshot(args)
+    return data, "Using list: " + match[0]["title"]
+
+
+def cmd_lists(args):
+    lists = lists_raw()
+    return {"ok": True, "lists": lists}, "\n".join("%s  %s" % (l["id"], l["title"]) for l in lists)
+
+
+def cmd_show(args):
+    data, _ = cmd_snapshot(args)
+    lines = ["# " + data["list"]["title"]]
+    for t in data["open"]:
+        due = "  (due %s)" % t["due"] if t["due"] else ""
+        lines.append("%s[ ] %s%s    %s" % ("    " * t["depth"], t["title"], due, t["id"]))
+    if data["completed"] and args.all:
+        for t in data["completed"]:
+            lines.append("[x] %s    %s" % (t["title"], t["id"]))
+    return data, "\n".join(lines)
+
+
+def list_id_for(args):
+    # --list-id (what the widget passes) and the saved selection are ids and
+    # need no lookup; --list may be a title.
+    if args.list_id:
+        return args.list_id
+    if args.list and args.list != "@default":
+        return resolve_list(lists_raw(), args.list)["id"]
+    return selected_list() or "@default"
+
+
+def task_path(args):
+    return "/lists/%s/tasks/%s" % (urllib.parse.quote(list_id_for(args), safe="@"),
+                                   urllib.parse.quote(args.task_id))
+
+
+def cmd_add(args):
+    title = " ".join(args.title).strip()
+    if not title:
+        raise GTasksError("A task needs a title.", "invalid")
+    body = {"title": title}
+    if args.notes:
+        body["notes"] = args.notes
+    if args.due:
+        time.strptime(args.due, "%Y-%m-%d")
+        body["due"] = args.due + "T00:00:00.000Z"
+    t = api("POST", "/lists/%s/tasks" % urllib.parse.quote(list_id_for(args), safe="@"), body)
+    return {"ok": True, "task": shape_task(t, 0)}, "Added: " + t.get("title", "")
+
+
+def cmd_done(args):
+    t = api("PATCH", task_path(args), {"status": "completed"})
+    return {"ok": True, "task": shape_task(t, 0)}, "Done: " + t.get("title", "")
+
+
+def cmd_undo(args):
+    t = api("PATCH", task_path(args), {"status": "needsAction", "completed": None})
+    return {"ok": True, "task": shape_task(t, 0)}, "Reopened: " + t.get("title", "")
+
+
+def cmd_delete(args):
+    api("DELETE", task_path(args))
+    return {"ok": True, "id": args.task_id}, "Deleted."
+
+
+# ------------------------------------------------------------------- cli
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gtasks", description="Google Tasks from the terminal and the Omarchy bar.")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("auth", help="sign in to Google (opens the browser)")
+    a.add_argument("--client-secret", help="OAuth client JSON downloaded from Google Cloud (copied into place)")
+    a.set_defaults(fn=cmd_auth)
+    sub.add_parser("logout", help="revoke and delete the stored token").set_defaults(fn=cmd_logout)
+    sub.add_parser("lists", help="show task lists").set_defaults(fn=cmd_lists)
+    s = sub.add_parser("use", help="make a list the default (by id or title)")
+    s.add_argument("name", nargs="+")
+    s.add_argument("--completed-limit", type=int, default=25)
+    s.set_defaults(fn=cmd_use)
+
+    for name, fn, helptext in (("snapshot", cmd_snapshot, "lists + tasks as JSON for the widget"),
+                               ("show", cmd_show, "show tasks")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("--list", help="list id or title (default: the one picked with `use`, else your first list)")
+        s.add_argument("--completed-limit", type=int, default=25)
+        if name == "show":
+            s.add_argument("--all", action="store_true", help="include completed tasks")
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("add", help="add a task")
+    s.add_argument("title", nargs="+")
+    s.add_argument("--list", help="list id or title")
+    s.add_argument("--list-id", help=argparse.SUPPRESS)
+    s.add_argument("--notes")
+    s.add_argument("--due", help="YYYY-MM-DD")
+    s.set_defaults(fn=cmd_add)
+
+    for name, fn, helptext in (("done", cmd_done, "mark a task done"),
+                               ("undo", cmd_undo, "reopen a completed task"),
+                               ("delete", cmd_delete, "delete a task")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("task_id")
+        s.add_argument("--list", help="list id or title")
+        s.add_argument("--list-id", help=argparse.SUPPRESS)
+        s.set_defaults(fn=fn)
+
+    args = p.parse_args()
+    try:
+        data, text = args.fn(args)
+    except GTasksError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e), "code": e.code}))
+        else:
+            print("gtasks: " + str(e), file=sys.stderr)
+        return 2 if e.code in ("auth_required", "auth_expired", "setup_required") else 1
+    except ValueError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e), "code": "invalid"}))
+        else:
+            print("gtasks: " + str(e), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    if args.json:
+        print(json.dumps(data))
+    elif text:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
