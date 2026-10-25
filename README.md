@@ -2,8 +2,9 @@
 
 An Omarchy bar widget for [Google Tasks](https://tasks.google.com/). The icon shows how
 many tasks are open. The panel lets you add tasks, check them off, reopen them,
-delete them, and switch between lists. Changes sync to Google right away and
-show up in the Google Tasks app on your phone.
+rename them, delete them, and switch between lists. Changes sync to Google
+right away and show up in the Google Tasks app on your phone. The panel is
+available in English and Hebrew.
 
 Everything goes through `gtasks`, a small Python CLI included here that uses
 only the standard library. It also works on its own in a terminal.
@@ -80,11 +81,15 @@ In the panel:
 | `a` / `i` / `o` / `/` | Add a task (Enter saves, Esc leaves the field) |
 | `j` / `k` / arrows | Move between tasks |
 | Space / Enter | Check off or reopen the selected task |
+| `e` | Rename the selected task (Enter saves, Esc cancels) |
 | `x` twice | Delete the selected task |
 | `h` / `l` | Previous or next list |
 | `c` | Show or hide completed tasks |
 | `r` | Refresh |
 | Esc | Close |
+
+The letter keys also work while a non-Latin keyboard layout (Hebrew, Russian,
+…) is active: they are read by their position on a US keyboard.
 
 `omarchy-shell emanuel.gtasks compose` (the shortcut from Install) opens the
 panel ready to add a task, or closes it when it is already open. The
@@ -93,15 +98,28 @@ panel ready to add a task, or closes it when it is already open. The
 Settings (`omarchy bar set emanuel.gtasks <key> <value>`): `showCount`
 (default `true`) and `refreshMinutes` (default `5`).
 
+## Language
+
+The panel follows the system language (`LANG`) when it is one the plugin
+knows, and falls back to English. The language button in the panel header
+cycles System → English → עברית. Hebrew switches the panel to right-to-left.
+The choice is saved in `~/.config/gtasks/settings.json`
+(`{"language": "system" | "en" | "he"}`), not in `shell.json`.
+
+To add a language, copy the `en` block in `i18n.js`, translate it, and add
+the language code to `names` and `locales` at the top of that file.
+
 ## CLI
 
 ```text
 gtasks show [--all]                      tasks in the current list
 gtasks add Buy milk --due 2026-10-20     add a task
 gtasks done|undo|delete TASK_ID          change a task (ids are shown by `show`)
+gtasks edit TASK_ID --title "New title"  rename a task; --notes and --due
+                                         change those ("" clears them)
 gtasks lists / gtasks use Work           list task lists / pick the default
 gtasks --json snapshot                   the JSON the widget renders
 ```
 
-Not supported yet: editing a task's title, notes, or due date, and reordering.
-Use the browser button in the panel for those.
+Not supported yet in the panel: notes, due dates (use `gtasks edit`), and
+reordering. Use the browser button in the panel for those.

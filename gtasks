@@ -12,6 +12,7 @@ flow (PKCE), keeps the refresh token in $XDG_STATE_HOME/gtasks/token.json
     gtasks show [--list ID]              show tasks
     gtasks add TITLE [--list ID] [--notes TEXT] [--due YYYY-MM-DD]
     gtasks done|undo|delete TASK_ID [--list ID]
+    gtasks edit TASK_ID [--title TEXT] [--notes TEXT] [--due YYYY-MM-DD] [--list ID]
     gtasks snapshot [--list ID]          everything the bar widget renders
 
 Every command takes --json. With it, the result (or {"ok": false, "error",
@@ -523,6 +524,26 @@ def cmd_delete(args):
     return {"ok": True, "id": args.task_id}, "Deleted."
 
 
+def cmd_edit(args):
+    body = {}
+    if args.title is not None:
+        title = args.title.strip()
+        if not title:
+            raise GTasksError("A task needs a title.", "invalid")
+        body["title"] = title
+    if args.notes is not None:
+        body["notes"] = args.notes
+    if args.due is not None:
+        # An empty --due clears the date.
+        if args.due:
+            time.strptime(args.due, "%Y-%m-%d")
+        body["due"] = args.due + "T00:00:00.000Z" if args.due else None
+    if not body:
+        raise GTasksError("Nothing to change. Pass --title, --notes or --due.", "invalid")
+    t = api("PATCH", task_path(args), body)
+    return {"ok": True, "task": shape_task(t, 0)}, "Saved: " + t.get("title", "")
+
+
 # ------------------------------------------------------------------- cli
 
 
@@ -566,6 +587,15 @@ def main():
         s.add_argument("--list", help="list id or title")
         s.add_argument("--list-id", help=argparse.SUPPRESS)
         s.set_defaults(fn=fn)
+
+    s = sub.add_parser("edit", help="change a task's title, notes or due date")
+    s.add_argument("task_id")
+    s.add_argument("--title")
+    s.add_argument("--notes", help='new notes ("" clears them)')
+    s.add_argument("--due", help='YYYY-MM-DD ("" clears it)')
+    s.add_argument("--list", help="list id or title")
+    s.add_argument("--list-id", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_edit)
 
     args = p.parse_args()
     try:

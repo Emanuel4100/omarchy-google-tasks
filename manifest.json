@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "emanuel.gtasks",
   "name": "Google Tasks",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Emanuel4100",
   "license": "MIT",
   "description": "Google Tasks in the bar: see open tasks, add new ones, and check them off without leaving Omarchy.",
